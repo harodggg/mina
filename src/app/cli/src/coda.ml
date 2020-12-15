@@ -191,10 +191,6 @@ let setup_daemon logger =
       ~doc:
         "true|false Log snark-pool diff received from peers (default: false)"
       (optional bool)
-  and log_received_blocks =
-    flag "log-received-blocks"
-      ~doc:"true|false Log blocks received from peers (default: false)"
-      (optional bool)
   and log_transaction_pool_diff =
     flag "log-txn-pool-gossip"
       ~doc:
@@ -226,6 +222,29 @@ let setup_daemon logger =
         "true|false Help keep the mesh connected when closing connections \
          (default: false)"
       (optional bool)
+  and max_connections =
+    flag "max-connections"
+      ~doc:
+        (Printf.sprintf
+           "NN max number of connections that this peer will have to \
+            neighbors in the gossip network. Tuning this higher will \
+            strengthen your connection to the network in exchange for using \
+            more RAM (default: %d)"
+           Cli_lib.Default.max_connections)
+      (optional int)
+  and validation_queue_size =
+    flag "validation-queue-size"
+      ~doc:
+        (Printf.sprintf
+           "NN size of the validation queue in the p2p network used to buffer \
+            messages (like blocks and transactions received on the gossip \
+            network) while validation is pending. If a transaction, for \
+            example, is invalid, we don't forward the message on the gossip \
+            net. If this queue is too small, we will drop messages without \
+            validating them. If it is too large, we are susceptible to DoS \
+            attacks on memory. (default: %d)"
+           Cli_lib.Default.validation_queue_size)
+      (optional int)
   and direct_peers_raw =
     flag "direct-peer"
       ~doc:
@@ -313,8 +332,7 @@ let setup_daemon logger =
       [ ("commit", `String Coda_version.commit_id)
       ; ("branch", `String Coda_version.branch)
       ; ("commit_date", `String Coda_version.commit_date)
-      ; ("marlin_commit", `String Coda_version.marlin_commit_id)
-      ; ("zexe_commit", `String Coda_version.zexe_commit_id) ]
+      ; ("marlin_commit", `String Coda_version.marlin_commit_id) ]
     in
     [%log info]
       "Coda daemon is booting up; built with commit $commit on branch $branch"
@@ -647,10 +665,6 @@ let setup_daemon logger =
         or_from_config YJ.Util.to_bool_option "log-snark-work-gossip"
           ~default:false log_received_snark_pool_diff
       in
-      let log_received_blocks =
-        or_from_config YJ.Util.to_bool_option "log-received-blocks"
-          ~default:false log_received_blocks
-      in
       let log_transaction_pool_diff =
         or_from_config YJ.Util.to_bool_option "log-txn-pool-gossip"
           ~default:false log_transaction_pool_diff
@@ -660,9 +674,9 @@ let setup_daemon logger =
           ~default:true log_block_creation
       in
       let log_gossip_heard =
-        { Coda_networking.Config.snark_pool_diff= log_received_snark_pool_diff
+        { Mina_networking.Config.snark_pool_diff= log_received_snark_pool_diff
         ; transaction_pool_diff= log_transaction_pool_diff
-        ; new_state= log_received_blocks }
+        ; new_state= true }
       in
       let json_to_publickey_compressed_option which json =
         YJ.Util.to_string_option json
@@ -844,7 +858,8 @@ let setup_daemon logger =
           ~genesis_state_hash:
             (With_hash.hash precomputed_values.protocol_state_with_hash)
       in
-      trace_database_initialization "consensus local state" __LOC__ trust_dir ;
+      trace_database_initialization "epoch ledger" __LOC__
+        epoch_ledger_location ;
       let%bind peer_list_file_contents_or_empty =
         match libp2p_peer_list_file with
         | None ->
@@ -879,6 +894,14 @@ let setup_daemon logger =
       let direct_peers =
         List.map ~f:Coda_net2.Multiaddr.of_string direct_peers_raw
       in
+      let max_connections =
+        or_from_config YJ.Util.to_int_option "max-connections"
+          ~default:Cli_lib.Default.max_connections max_connections
+      in
+      let validation_queue_size =
+        or_from_config YJ.Util.to_int_option "validation-queue-size"
+          ~default:Cli_lib.Default.validation_queue_size validation_queue_size
+      in
       if enable_tracing then Coda_tracing.start conf_dir |> don't_wait_for ;
       if is_seed then [%log info] "Starting node as a seed node"
       else if List.is_empty initial_peers then
@@ -904,11 +927,13 @@ Pass one of -peer, -peer-list-file, -seed.|} ;
           ; flooding= Option.value ~default:false enable_flooding
           ; direct_peers
           ; peer_exchange= Option.value ~default:false peer_exchange
+          ; max_connections
+          ; validation_queue_size
           ; isolate= Option.value ~default:false isolate
           ; keypair= libp2p_keypair }
       in
       let net_config =
-        { Coda_networking.Config.logger
+        { Mina_networking.Config.logger
         ; trust_system
         ; time_controller
         ; consensus_local_state
@@ -917,7 +942,7 @@ Pass one of -peer, -peer-list-file, -seed.|} ;
         ; log_gossip_heard
         ; is_seed
         ; creatable_gossip_net=
-            Coda_networking.Gossip_net.(
+            Mina_networking.Gossip_net.(
               Any.Creatable ((module Libp2p), Libp2p.create gossip_net_params))
         }
       in
@@ -934,10 +959,26 @@ Pass one of -peer, -peer-list-file, -seed.|} ;
       let external_transition_database_dir =
         conf_dir ^/ "external_transition_database"
       in
-      let%bind () = Async.Unix.mkdir ~p:() external_transition_database_dir in
-      let external_transition_database =
-        Auxiliary_database.External_transition_database.create ~logger
-          external_transition_database_dir
+      let%bind external_transition_database =
+        let create_db () =
+          let%map () =
+            Async.Unix.mkdir ~p:() external_transition_database_dir
+          in
+          Auxiliary_database.External_transition_database.create ~logger
+            external_transition_database_dir
+        in
+        match%bind Deferred.Or_error.try_with create_db with
+        | Ok res ->
+            return res
+        | Error err ->
+            [%log warn]
+              "Encountered an error $err while creating the external \
+               transition database. Retrying."
+              ~metadata:[("err", Error_json.error_to_yojson err)] ;
+            let%bind () =
+              File_system.remove_dir external_transition_database_dir
+            in
+            create_db ()
       in
       trace_database_initialization "external_transition_database" __LOC__
         external_transition_database_dir ;

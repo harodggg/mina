@@ -11,6 +11,8 @@ open Network_peer
 module type Resource_pool_base_intf = sig
   type t [@@deriving sexp_of]
 
+  val label : string
+
   type transition_frontier_diff
 
   type transition_frontier
@@ -58,6 +60,12 @@ module type Resource_pool_diff_intf = sig
   val size : t -> int
 
   val verified_size : verified -> int
+
+  (** How big to consider this diff for purposes of metering. *)
+  val score : t -> int
+
+  (** The maximum "diff score" permitted per IP/peer-id per second. *)
+  val max_per_second : int
 
   val summary : t -> string
 
@@ -128,7 +136,7 @@ module type Network_pool_base_intf = sig
   module Broadcast_callback : sig
     type t =
       | Local of ((resource_pool_diff * rejected_diff) Or_error.t -> unit)
-      | External of (Coda_net2.validation_result -> unit)
+      | External of Coda_net2.Validation_callback.t
   end
 
   val create :
@@ -137,7 +145,7 @@ module type Network_pool_base_intf = sig
     -> consensus_constants:Consensus.Constants.t
     -> time_controller:Block_time.Controller.t
     -> incoming_diffs:( resource_pool_diff Envelope.Incoming.t
-                      * (Coda_net2.validation_result -> unit) )
+                      * Coda_net2.Validation_callback.t )
                       Strict_pipe.Reader.t
     -> local_diffs:( resource_pool_diff
                    * ((resource_pool_diff * rejected_diff) Or_error.t -> unit)
@@ -153,7 +161,7 @@ module type Network_pool_base_intf = sig
     -> logger:Logger.t
     -> constraint_constants:Genesis_constants.Constraint_constants.t
     -> incoming_diffs:( resource_pool_diff Envelope.Incoming.t
-                      * (Coda_net2.validation_result -> unit) )
+                      * Coda_net2.Validation_callback.t )
                       Strict_pipe.Reader.t
     -> local_diffs:( resource_pool_diff
                    * ((resource_pool_diff * rejected_diff) Or_error.t -> unit)
